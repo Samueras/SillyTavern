@@ -39,6 +39,13 @@
     opacity: 1;
 }
 
+/* Per-message narrate button while TTS is generating/playing */
+.mes_narrate.narrating {
+    opacity: 1;
+    color: var(--warning, #d29922);
+    cursor: progress;
+}
+
 .tts_block {
     display: flex;
     align-items: baseline;
