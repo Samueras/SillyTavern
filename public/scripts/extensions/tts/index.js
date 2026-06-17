@@ -53,6 +53,12 @@ let periodicMessageGenerationTimer = null;
 let lastPositionOfParagraphEnd = -1;
 let currentInitVoiceMapPromise = null;
 
+// Buffer for clustering streaming paragraph deltas before sending to TTS
+/** @type {string} */
+let streamingClusterBuffer = '';
+/** @type {TtsMessage|null} Template job carrying name/is_user/id etc. for the buffered text */
+let streamingClusterTemplate = null;
+
 const DEFAULT_VOICE_MARKER = '[Default Voice]';
 const DISABLED_VOICE_MARKER = 'disabled';
 
@@ -259,7 +265,7 @@ function updateMesNarrateState() {
 
 /**
  * Toggle the "narrating" visual state on a single message's narrate button.
- * Swaps the bullhorn icon for a spinner while active.
+ * Pulses the existing bullhorn icon while active (no icon swap = no layout shift).
  * @param {number} mesId
  * @param {boolean} isNarrating
  * @param {JQuery<HTMLElement>} [$btn] Pre-selected button element (optional)
@@ -270,11 +276,7 @@ function setMesNarrateState(mesId, isNarrating, $btn) {
     }
     if (!$btn.length) return;
 
-    if (isNarrating) {
-        $btn.removeClass('fa-bullhorn').addClass('fa-spinner fa-spin narrating');
-    } else {
-        $btn.removeClass('fa-spinner fa-spin narrating').addClass('fa-bullhorn');
-    }
+    $btn.toggleClass('narrating', isNarrating);
 }
 
 function resetTtsPlayback() {
@@ -296,10 +298,12 @@ function resetTtsPlayback() {
     // Set audio ready to process again
     audioQueueProcessorReady = true;
 
-    // Clear any spinning narrate buttons immediately
-    $('.mes_narrate.narrating')
-        .removeClass('fa-spinner fa-spin narrating')
-        .addClass('fa-bullhorn');
+    // Discard any uncommitted streaming cluster
+    streamingClusterBuffer = '';
+    streamingClusterTemplate = null;
+
+    // Clear any pulsing narrate buttons immediately
+    $('.mes_narrate.narrating').removeClass('narrating');
 }
 
 function isTtsProcessing() {
@@ -1323,8 +1327,19 @@ async function onMessageEvent(messageId, lastCharIndex) {
     console.debug(`Adding message from ${message.name} for TTS processing: "${message.mes}"`);
 
     if (extension_settings.tts.periodic_auto_generation && isStreamingEnabled()) {
-        message.id = messageId;
-        ttsJobQueue.push(message);
+        const clusterTarget = Number(extension_settings.tts.paragraph_cluster_size) || 0;
+        if (clusterTarget > 0) {
+            // Accumulate streaming paragraph deltas into a cluster until the target is reached
+            streamingClusterBuffer += (streamingClusterBuffer ? '\n' : '') + message.mes;
+            // Keep the latest message as the template so name/is_user/id stay current
+            streamingClusterTemplate = Object.assign({}, message, { id: messageId });
+            if (getTokenCount(streamingClusterBuffer) >= clusterTarget) {
+                flushStreamingCluster();
+            }
+        } else {
+            message.id = messageId;
+            ttsJobQueue.push(message);
+        }
     } else {
         processAndQueueTtsMessage(message, messageId, { manual: false });
     }
@@ -1380,7 +1395,22 @@ async function onGenerationStarted(generationType, _args, isDryRun) {
     }
 }
 
+/**
+ * Flush whatever text is in the streaming cluster buffer to the TTS job queue.
+ * Called when the token threshold is reached during streaming, or when generation ends.
+ */
+function flushStreamingCluster() {
+    if (!streamingClusterBuffer || !streamingClusterTemplate) {
+        return;
+    }
+    ttsJobQueue.push(Object.assign({}, streamingClusterTemplate, { mes: streamingClusterBuffer }));
+    streamingClusterBuffer = '';
+    streamingClusterTemplate = null;
+}
+
 async function onGenerationEnded() {
+    // Flush any accumulated streaming cluster before stopping the timer
+    flushStreamingCluster();
     if (periodicMessageGenerationTimer) {
         clearInterval(periodicMessageGenerationTimer);
         periodicMessageGenerationTimer = null;

@@ -40,9 +40,14 @@
 }
 
 /* Per-message narrate button while TTS is generating/playing */
+@keyframes tts-narrate-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+}
+
 .mes_narrate.narrating {
-    opacity: 1;
     color: var(--warning, #d29922);
+    animation: tts-narrate-pulse 1.2s ease-in-out infinite;
     cursor: progress;
 }
 
