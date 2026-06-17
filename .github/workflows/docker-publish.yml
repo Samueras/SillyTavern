@@ -10,8 +10,9 @@ on:
     # Build the staging image everyday at 00:00 UTC
     - cron: "0 0 * * *"
   push:
-    # Temporary workaround
+    # Build on every push to staging (fork drop-in image) and release
     branches:
+      - staging
       - release
 
 env:
@@ -21,7 +22,7 @@ env:
 
 jobs:
   build:
-    if: github.repository == 'SillyTavern/SillyTavern'
+    # Original guard removed so forks can publish to their own GHCR namespace
     runs-on: ubuntu-latest
 
     steps:
@@ -34,16 +35,21 @@ jobs:
       # does not support logical AND/OR operations on triggers
       # It's currently not possible to have `branches` under the `schedule` trigger
       - name: Checkout the release branch (on release)
-        if: ${{ github.event_name == 'release' || github.event_name == 'push' }}
+        if: ${{ github.event_name == 'release' }}
         uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
         with:
           ref: "release"
 
-      - name: Checkout the staging branch
+      - name: Checkout the staging branch (on schedule)
         if: ${{ github.event_name == 'schedule' }}
         uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
         with:
           ref: "staging"
+
+      # On push events, check out the branch that was actually pushed to
+      - name: Checkout the pushed branch (on push)
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
 
       # Get current branch name
       # This is also part of the workaround for Actions not allowing logical
@@ -65,12 +71,14 @@ jobs:
         id: metadata
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # Release version tag if the workflow is triggered by a release
-          # Branch name tag if the workflow is triggered by a push
-          # Latest tag if the branch is release and the workflow is triggered by a push
+          # Tag strategy:
+          #  - release event      -> version tag (e.g. 1.12.10) + latest on release branch
+          #  - push to staging     -> "staging" + short commit sha
+          #  - push to release     -> "release" + "latest"
           tags: |
             ${{ github.event_name == 'release' && github.ref_name || env.BRANCH_NAME }}
             ${{ github.event_name == 'push' && env.BRANCH_NAME == 'release' && 'latest' || '' }}
+            type=sha,format=short,prefix=${{ env.BRANCH_NAME }}-
 
       # Login into package repository as the person who created the release
       - name: Log in to the Container registry
