@@ -35,6 +35,19 @@
                     <input type="checkbox" id="tts_narrate_by_paragraphs">
                     <small data-i18n="Narrate by paragraphs (when not streaming)">Narrate by paragraphs (when not streaming)</small>
                 </label>
+                <div id="tts_paragraph_cluster_block" class="marginLeft marginTop5" style="display:none;">
+                    <div class="range-block-title justifyLeft">
+                        <small data-i18n="Cluster paragraphs up to N tokens (0 = one TTS call per paragraph)">Cluster paragraphs up to N tokens (0 = one TTS call per paragraph)</small>
+                    </div>
+                    <div class="range-block-range-and-counter">
+                        <div class="range-block-range">
+                            <input type="range" id="tts_paragraph_cluster_size" name="tts_paragraph_cluster_size" min="0" max="2000" step="50">
+                        </div>
+                        <div class="range-block-counter">
+                            <input type="number" min="0" max="2000" step="50" data-for="tts_paragraph_cluster_size" id="tts_paragraph_cluster_size_counter">
+                        </div>
+                    </div>
+                </div>
                 <label class="checkbox_label" for="tts_narrate_quoted">
                     <input type="checkbox" id="tts_narrate_quoted">
                     <small data-i18n="Only narrate quotes">Only narrate "quotes"</small>

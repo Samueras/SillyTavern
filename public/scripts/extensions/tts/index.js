@@ -2,6 +2,7 @@ import { cancelTtsPlay, eventSource, event_types, getCurrentChatId, isStreamingE
 import { ModuleWorkerWrapper, extension_settings, getContext, renderExtensionTemplateAsync } from '../../extensions.js';
 import { delay, escapeRegex, getBase64Async, getStringHash, onlyUnique, regexFromString } from '../../utils.js';
 import { accountStorage } from '../../util/AccountStorage.js';
+import { getTokenCount } from '../../tokenizers.js';
 import { EdgeTtsProvider } from './edge.js';
 import { ElevenLabsTtsProvider } from './elevenlabs.js';
 import { SileroTtsProvider } from './silerotts.js';
@@ -51,6 +52,12 @@ let lastMessageHash = null;
 let periodicMessageGenerationTimer = null;
 let lastPositionOfParagraphEnd = -1;
 let currentInitVoiceMapPromise = null;
+
+// Buffer for clustering streaming paragraph deltas before sending to TTS
+/** @type {string} */
+let streamingClusterBuffer = '';
+/** @type {TtsMessage|null} Template job carrying name/is_user/id etc. for the buffered text */
+let streamingClusterTemplate = null;
 
 const DEFAULT_VOICE_MARKER = '[Default Voice]';
 const DISABLED_VOICE_MARKER = 'disabled';
@@ -167,6 +174,8 @@ async function onNarrateOneMessage() {
 
     resetTtsPlayback();
     processAndQueueTtsMessage(message, Number(id), { manual: true });
+    // Immediate visual feedback before the next moduleWorker tick
+    setMesNarrateState(Number(id), true);
     moduleWorker();
 }
 
@@ -216,6 +225,58 @@ async function moduleWorker() {
     processTtsQueue();
     processAudioJobQueue();
     updateUiAudioPlayState();
+    updateMesNarrateState();
+}
+
+/**
+ * Get the set of message IDs that are currently being narrated (queued for TTS,
+ * currently generating TTS audio, queued for playback, or currently playing).
+ * @returns {Set<number>}
+ */
+function getNarratingMessageIds() {
+    const ids = new Set();
+    for (const job of ttsJobQueue) {
+        if (typeof job.id === 'number') ids.add(job.id);
+    }
+    if (currentTtsJob && typeof currentTtsJob.id === 'number') {
+        ids.add(currentTtsJob.id);
+    }
+    for (const job of audioJobQueue) {
+        if (typeof job.messageId === 'number') ids.add(job.messageId);
+    }
+    if (currentAudioJob && typeof currentAudioJob.messageId === 'number') {
+        ids.add(currentAudioJob.messageId);
+    }
+    return ids;
+}
+
+/**
+ * Update the visual state of all per-message narrate buttons to reflect
+ * which messages are currently being narrated.
+ */
+function updateMesNarrateState() {
+    const narratingIds = getNarratingMessageIds();
+    $('.mes_narrate').each(function () {
+        const $btn = $(this);
+        const mesId = Number($btn.closest('.mes').attr('mesid'));
+        setMesNarrateState(mesId, narratingIds.has(mesId), $btn);
+    });
+}
+
+/**
+ * Toggle the "narrating" visual state on a single message's narrate button.
+ * Pulses the existing bullhorn icon while active (no icon swap = no layout shift).
+ * @param {number} mesId
+ * @param {boolean} isNarrating
+ * @param {JQuery<HTMLElement>} [$btn] Pre-selected button element (optional)
+ */
+function setMesNarrateState(mesId, isNarrating, $btn) {
+    if (!$btn || !$btn.length) {
+        $btn = $(`.mes[mesid="${mesId}"] .mes_narrate`);
+    }
+    if (!$btn.length) return;
+
+    $btn.toggleClass('narrating', isNarrating);
 }
 
 function resetTtsPlayback() {
@@ -236,6 +297,13 @@ function resetTtsPlayback() {
 
     // Set audio ready to process again
     audioQueueProcessorReady = true;
+
+    // Discard any uncommitted streaming cluster
+    streamingClusterBuffer = '';
+    streamingClusterTemplate = null;
+
+    // Clear any pulsing narrate buttons immediately
+    $('.mes_narrate.narrating').removeClass('narrating');
 }
 
 function isTtsProcessing() {
@@ -259,6 +327,13 @@ function isTtsProcessing() {
 /**
  * Clones a message, attaches the given message ID, then splits by paragraphs
  * (if enabled) and adds each part to the TTS job queue.
+ *
+ * When `narrate_by_paragraphs` is on and `paragraph_cluster_size` is greater
+ * than 0, paragraphs are accumulated into clusters that aim for the target
+ * token count. A new cluster is started only after a paragraph boundary that
+ * pushes the running chunk over the threshold (the boundary paragraph is
+ * always included in the chunk that triggered the cutoff, so calls never
+ * split mid-paragraph).
  * @param {ChatMessage} message - The message object to be processed.
  * @param {number|null} [messageId=null] - The chat message index to associate with TTS events.
  * @param {object} [options={}] - Additional options for processing.
@@ -276,21 +351,72 @@ function processAndQueueTtsMessage(message, messageId = null, { manual = false }
         return;
     }
 
-    const lines = clone.mes.split('\n');
+    const clusterTarget = Number(extension_settings.tts.paragraph_cluster_size) || 0;
 
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
+    // One TTS call per paragraph (original behavior)
+    if (clusterTarget <= 0) {
+        const lines = clone.mes.split('\n');
+        for (const line of lines) {
+            if (line.length === 0) {
+                continue;
+            }
+            ttsJobQueue.push(Object.assign({}, clone, { mes: line }));
+        }
+        return;
+    }
 
-        if (line.length === 0) {
+    // Cluster paragraphs up to ~clusterTarget tokens, breaking only on paragraph boundaries
+    const paragraphs = clone.mes.split('\n').filter(line => line.length > 0);
+    const clusters = clusterParagraphsByTokens(paragraphs, clusterTarget);
+
+    for (const chunk of clusters) {
+        if (chunk.length === 0) {
             continue;
         }
-
-        ttsJobQueue.push(
-            Object.assign({}, clone, {
-                mes: line,
-            }),
-        );
+        ttsJobQueue.push(Object.assign({}, clone, { mes: chunk }));
     }
+}
+
+/**
+ * Group an ordered list of paragraphs into chunks that each aim for the target
+ * token count. A paragraph is never split across chunks. Paragraphs are added
+ * to the current chunk one at a time; when adding a paragraph pushes the chunk
+ * over the target, that paragraph is still included in the current chunk
+ * (finishing the paragraph), and the next paragraph starts a fresh chunk.
+ *
+ * Special cases:
+ *   - A paragraph larger than `targetTokens` becomes its own chunk (or joins
+ *     an empty/just-flushed chunk on its own).
+ *   - Two paragraphs are always joined by a single newline.
+ *
+ * @param {string[]} paragraphs Ordered, non-empty paragraph strings.
+ * @param {number} targetTokens Target maximum token count per chunk.
+ * @returns {string[]} Array of joined chunk strings.
+ */
+function clusterParagraphsByTokens(paragraphs, targetTokens) {
+    const chunks = [];
+    let current = [];
+
+    const flush = () => {
+        if (current.length > 0) {
+            chunks.push(current.join('\n'));
+            current = [];
+        }
+    };
+
+    for (const paragraph of paragraphs) {
+        current.push(paragraph);
+
+        // If adding this paragraph pushed us over the target, close the chunk
+        // (boundary paragraph included) so the next paragraph starts fresh.
+        const joinedTokens = getTokenCount(current.join('\n'));
+        if (joinedTokens >= targetTokens) {
+            flush();
+        }
+    }
+
+    flush();
+    return chunks;
 }
 
 function debugTtsPlayback() {
@@ -320,7 +446,7 @@ audioElement.autoplay = true;
 
 /**
  * @type AudioJob[] Audio job queue
- * @typedef {{audioBlob: Blob | string, char: string}} AudioJob Audio job object
+ * @typedef {{audioBlob: Blob | string, char: string, messageId?: number | null}} AudioJob Audio job object
  */
 const audioJobQueue = [];
 /**
@@ -447,6 +573,7 @@ function completeCurrentAudioJob() {
     audioQueueProcessorReady = true;
     currentAudioJob = null;
     // updateUiPlayState();
+    updateMesNarrateState();
     wrapper.update();
 }
 
@@ -468,7 +595,7 @@ async function addAudioJob(response, char) {
         }
         mimeType = audioBlob.type;
     }
-    audioJobQueue.push({ audioBlob, char });
+    audioJobQueue.push({ audioBlob, char, messageId: currentTtsJob?.id ?? null });
     console.debug('Pushed audio job to queue.');
     return { audioBlob, mimeType };
 }
@@ -501,6 +628,7 @@ let currentTtsJob = null; // Null if nothing is currently being processed
 function completeTtsJob() {
     console.info(`Current TTS job for ${currentTtsJob?.name} completed.`);
     currentTtsJob = null;
+    updateMesNarrateState();
 }
 
 async function tts(text, voiceId, char, voiceMapKey = null) {
@@ -883,6 +1011,9 @@ function loadSettings() {
     $('#tts_auto_generation').prop('checked', extension_settings.tts.auto_generation);
     $('#tts_periodic_auto_generation').prop('checked', extension_settings.tts.periodic_auto_generation);
     $('#tts_narrate_by_paragraphs').prop('checked', extension_settings.tts.narrate_by_paragraphs);
+    $('#tts_paragraph_cluster_size').val(extension_settings.tts.paragraph_cluster_size);
+    $('#tts_paragraph_cluster_size_counter').val(extension_settings.tts.paragraph_cluster_size);
+    $('#tts_paragraph_cluster_block').toggle(extension_settings.tts.narrate_by_paragraphs);
     $('#tts_narrate_translated_only').prop('checked', extension_settings.tts.narrate_translated_only);
     $('#tts_narrate_user').prop('checked', extension_settings.tts.narrate_user);
     $('#tts_pass_asterisks').prop('checked', extension_settings.tts.pass_asterisks);
@@ -910,6 +1041,7 @@ const defaultSettings = {
     multi_voice_enabled: false,
     apply_regex: false,
     regex_pattern: '',
+    paragraph_cluster_size: 0,
 };
 
 function setTtsStatus(status, success) {
@@ -962,6 +1094,15 @@ function onPeriodicAutoGenerationClick() {
 
 function onNarrateByParagraphsClick() {
     extension_settings.tts.narrate_by_paragraphs = !!$('#tts_narrate_by_paragraphs').prop('checked');
+    $('#tts_paragraph_cluster_block').toggle(extension_settings.tts.narrate_by_paragraphs);
+    saveSettingsDebounced();
+}
+
+function onParagraphClusterSizeChange() {
+    const value = Number($(this).val()) || 0;
+    extension_settings.tts.paragraph_cluster_size = value;
+    $('#tts_paragraph_cluster_size').val(value);
+    $('#tts_paragraph_cluster_size_counter').val(value);
     saveSettingsDebounced();
 }
 
@@ -1186,8 +1327,19 @@ async function onMessageEvent(messageId, lastCharIndex) {
     console.debug(`Adding message from ${message.name} for TTS processing: "${message.mes}"`);
 
     if (extension_settings.tts.periodic_auto_generation && isStreamingEnabled()) {
-        message.id = messageId;
-        ttsJobQueue.push(message);
+        const clusterTarget = Number(extension_settings.tts.paragraph_cluster_size) || 0;
+        if (clusterTarget > 0) {
+            // Accumulate streaming paragraph deltas into a cluster until the target is reached
+            streamingClusterBuffer += (streamingClusterBuffer ? '\n' : '') + message.mes;
+            // Keep the latest message as the template so name/is_user/id stay current
+            streamingClusterTemplate = Object.assign({}, message, { id: messageId });
+            if (getTokenCount(streamingClusterBuffer) >= clusterTarget) {
+                flushStreamingCluster();
+            }
+        } else {
+            message.id = messageId;
+            ttsJobQueue.push(message);
+        }
     } else {
         processAndQueueTtsMessage(message, messageId, { manual: false });
     }
@@ -1243,7 +1395,22 @@ async function onGenerationStarted(generationType, _args, isDryRun) {
     }
 }
 
+/**
+ * Flush whatever text is in the streaming cluster buffer to the TTS job queue.
+ * Called when the token threshold is reached during streaming, or when generation ends.
+ */
+function flushStreamingCluster() {
+    if (!streamingClusterBuffer || !streamingClusterTemplate) {
+        return;
+    }
+    ttsJobQueue.push(Object.assign({}, streamingClusterTemplate, { mes: streamingClusterBuffer }));
+    streamingClusterBuffer = '';
+    streamingClusterTemplate = null;
+}
+
 async function onGenerationEnded() {
+    // Flush any accumulated streaming cluster before stopping the timer
+    flushStreamingCluster();
     if (periodicMessageGenerationTimer) {
         clearInterval(periodicMessageGenerationTimer);
         periodicMessageGenerationTimer = null;
@@ -1546,6 +1713,8 @@ export async function init() {
         $('#tts_auto_generation').on('click', onAutoGenerationClick);
         $('#tts_periodic_auto_generation').on('click', onPeriodicAutoGenerationClick);
         $('#tts_narrate_by_paragraphs').on('click', onNarrateByParagraphsClick);
+        $('#tts_paragraph_cluster_size').on('input', onParagraphClusterSizeChange);
+        $('#tts_paragraph_cluster_size_counter').on('input', onParagraphClusterSizeChange);
         $('#tts_narrate_user').on('click', onNarrateUserClick);
         $('#tts_multi_voice_enabled').on('click', onMultiVoiceClick);
         $('#tts_apply_regex').on('change', onApplyRegexChange);

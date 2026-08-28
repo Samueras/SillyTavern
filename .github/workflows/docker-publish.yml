@@ -1,4 +1,6 @@
-# This workflow will publish a docker image for every full release to the GitHub package repository
+# This workflow publishes a multi-arch Docker image (amd64 + arm64) to GHCR.
+# Fork-friendly: no upstream repository guard, builds run on push to
+# staging/release, on releases, and on a daily schedule for staging.
 
 name: Create Docker Image (Release and Staging)
 
@@ -7,88 +9,184 @@ on:
     # Allow pre-releases
     types: [published]
   schedule:
-    # Build the staging image everyday at 00:00 UTC
+    # Build the staging image every day at 00:00 UTC
     - cron: "0 0 * * *"
   push:
-    # Temporary workaround
+    # Build on every push to staging (fork drop-in image) and release
     branches:
+      - staging
       - release
 
 env:
-  # This should allow creation of docker images even in forked repositories
+  # Allows image creation in forked repositories under their own namespace
   REPO: ${{ github.repository }}
   REGISTRY: ghcr.io
 
 jobs:
-  build:
-    if: github.repository == 'SillyTavern/SillyTavern'
+  # ---------------------------------------------------------------------------
+  # Resolve the canonical tag name once and share it with the arch jobs.
+  # This avoids the "git tag shadows branch name" problem we hit earlier.
+  # ---------------------------------------------------------------------------
+  resolve-meta:
     runs-on: ubuntu-latest
-
+    outputs:
+      image_name: ${{ steps.meta.outputs.image_name }}
+      tag: ${{ steps.meta.outputs.tag }}
+      sha_tag: ${{ steps.meta.outputs.sha_tag }}
+      is_release_branch: ${{ steps.meta.outputs.is_release_branch }}
     steps:
-      # Workaround for GitHub repo names containing uppercase characters
-      - name: Set lowercase repo name
+      - name: Resolve image name and tag
+        id: meta
         run: |
-          echo "IMAGE_NAME=${REPO,,}" >> ${GITHUB_ENV}
+          # Lowercase the full repo slug for GHCR
+          IMAGE_NAME="${REPO,,}"
+          echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
 
-      # Using the following workaround because currently GitHub Actions
-      # does not support logical AND/OR operations on triggers
-      # It's currently not possible to have `branches` under the `schedule` trigger
-      - name: Checkout the release branch (on release)
-        if: ${{ github.event_name == 'release' || github.event_name == 'push' }}
+          # Determine the effective ref name.
+          # - release event  -> tag name (e.g. 1.12.10)
+          # - schedule       -> staging
+          # - push           -> branch name (staging or release)
+          case "${{ github.event_name }}" in
+            release)
+              TAG="${{ github.ref_name }}"
+              ;;
+            schedule)
+              TAG="staging"
+              ;;
+            *)
+              TAG="${{ github.ref_name }}"
+              ;;
+          esac
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          # Short sha, prefixed with the tag for traceability
+          SHA_TAG="${TAG}-${GITHUB_SHA::7}"
+          echo "sha_tag=${SHA_TAG}" >> "$GITHUB_OUTPUT"
+
+          # Track whether we're on the release branch so we can also tag :latest
+          if [ "$TAG" = "release" ] || [ "${{ github.event_name }}" = "release" ]; then
+            echo "is_release_branch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release_branch=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Per-arch builds on GitHub's native runners (no QEMU).
+  # Each job builds a single-platform image and pushes it as an architecture-
+  # specific tag. The merge job then assembles them into a multi-arch manifest.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: resolve-meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout (release event)
+        if: ${{ github.event_name == 'release' }}
         uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
         with:
           ref: "release"
 
-      - name: Checkout the staging branch
+      - name: Checkout (schedule -> staging)
         if: ${{ github.event_name == 'schedule' }}
         uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
         with:
           ref: "staging"
 
-      # Get current branch name
-      # This is also part of the workaround for Actions not allowing logical
-      # AND/OR operators on triggers
-      # Otherwise the action triggered by schedule always has ref_name = release
-      - name: Get the current branch name
-        run: |
-          echo "BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD)" >> ${GITHUB_ENV}
-
-      # Setting up QEMU for multi-arch image build
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - name: Checkout (push)
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Extract metadata (tags, labels) for the image
-        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81 # v5.5.1
-        id: metadata
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # Release version tag if the workflow is triggered by a release
-          # Branch name tag if the workflow is triggered by a push
-          # Latest tag if the branch is release and the workflow is triggered by a push
-          tags: |
-            ${{ github.event_name == 'release' && github.ref_name || env.BRANCH_NAME }}
-            ${{ github.event_name == 'push' && env.BRANCH_NAME == 'release' && 'latest' || '' }}
-
-      # Login into package repository as the person who created the release
-      - name: Log in to the Container registry
+      - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build docker image using dockerfile for amd64 and arm64
-      # Tag it with branch name
-      # Assumes branch name is the version number
-      - name: Build and push
+      # Architecture-specific tag so the merge job can reference a single
+      # platform image without ambiguity (e.g. ...:staging-amd64).
+      - name: Build and push single-platform image
         uses: docker/build-push-action@2cdde995de11925a030ce8070c3d77a52ffcf1c0 # v5.3.0
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
           file: Dockerfile
+          platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ needs.resolve-meta.outputs.image_name }}:${{ needs.resolve-meta.outputs.sha_tag }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.title=SillyTavern
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  # ---------------------------------------------------------------------------
+  # Merge the two arch-specific images into a single multi-arch manifest,
+  # tagged with the branch/release name (+ :latest on the release branch).
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [resolve-meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install ORAS (for manifest operations)
+        uses: oras-project/setup-oras@v1
+
+      - name: Assemble multi-arch manifest and tag
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.resolve-meta.outputs.image_name }}
+          TAG: ${{ needs.resolve-meta.outputs.tag }}
+          SHA_TAG: ${{ needs.resolve-meta.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+
+          # Build a multi-arch manifest from the per-arch images we just pushed.
+          docker buildx imagetools create -t "${IMAGE}:${TAG}" \
+            "${IMAGE}:${SHA_TAG}-amd64" \
+            "${IMAGE}:${SHA_TAG}-arm64"
+
+          # Also tag with the commit-sha tag for an immutable reference.
+          docker buildx imagetools create -t "${IMAGE}:${SHA_TAG}" \
+            "${IMAGE}:${SHA_TAG}-amd64" \
+            "${IMAGE}:${SHA_TAG}-arm64"
+
+          # Tag :latest on release branch / release events.
+          if [ "${{ needs.resolve-meta.outputs.is_release_branch }}" = "true" ]; then
+            docker buildx imagetools create -t "${IMAGE}:latest" \
+              "${IMAGE}:${SHA_TAG}-amd64" \
+              "${IMAGE}:${SHA_TAG}-arm64"
+          fi
+
+      - name: Show resulting tags
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.resolve-meta.outputs.image_name }}
+        run: |
+          echo "Published tags:"
+          echo "  ${IMAGE}:${{ needs.resolve-meta.outputs.tag }}"
+          echo "  ${IMAGE}:${{ needs.resolve-meta.outputs.sha_tag }}"
+          if [ "${{ needs.resolve-meta.outputs.is_release_branch }}" = "true" ]; then
+            echo "  ${IMAGE}:latest"
+          fi

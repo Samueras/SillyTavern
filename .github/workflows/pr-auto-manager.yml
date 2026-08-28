@@ -12,10 +12,18 @@ permissions:
   pull-requests: write
 
 jobs:
+  # Single guard job: forks skip everything below via the `needs` chain.
+  fork-guard:
+    name: 🛡️ Skip on Forks
+    runs-on: ubuntu-latest
+    if: github.repository == 'SillyTavern/SillyTavern'
+    steps:
+      - run: echo "Running on upstream repo, proceeding."
+
   label-by-size:
     name: 🏷️ Label PR by Size
     # This job should run after all others, to prevent possible concurrency issues
-    needs: [label-by-branches, label-by-files, label-copilot-prs, remove-stale-label, check-merge-blocking-labels, write-auto-comments]
+    needs: [label-by-branches, label-by-files, label-copilot-prs, remove-stale-label, check-merge-blocking-labels, write-auto-comments, fork-guard]
     runs-on: ubuntu-latest
     # Only needs to run when code is changed
     if: always() && (github.event.action == 'opened' || github.event.action == 'synchronize')
@@ -60,6 +68,7 @@ jobs:
   label-by-branches:
     name: 🏷️ Label PR by Branches
     runs-on: ubuntu-latest
+    needs: [fork-guard]
     # Only label once when PR is created or when base branch is changed, to allow manual label removal
     if: always() && (github.event.action == 'opened' || (github.event.action == 'synchronize' && github.event.changes.base))
 
@@ -123,6 +132,7 @@ jobs:
   label-copilot-prs:
     name: 🏷️ Label Copilot PRs as Vibe Coded
     runs-on: ubuntu-latest
+    needs: [fork-guard]
     # Only label once when PR is created by Copilot
     if: >
       github.event.action == 'opened' &&
@@ -189,7 +199,7 @@ jobs:
 
   check-merge-blocking-labels:
     name: 🚫 Check Merge Blocking Labels
-    needs: [label-by-branches, label-by-files, label-copilot-prs, remove-stale-label]
+    needs: [label-by-branches, label-by-files, label-copilot-prs, remove-stale-label, fork-guard]
     runs-on: ubuntu-latest
     # Run, even if the previous jobs were skipped/failed
     if: always()
@@ -239,7 +249,7 @@ jobs:
 
   write-auto-comments:
     name: 💬 Post PR Comments Based on Labels
-    needs: [label-by-branches, label-by-files, label-copilot-prs, remove-stale-label, check-merge-blocking-labels]
+    needs: [label-by-branches, label-by-files, label-copilot-prs, remove-stale-label, check-merge-blocking-labels, fork-guard]
     runs-on: ubuntu-latest
     # Run, even if the previous jobs were skipped/failed
     if: always() && (github.event_name == 'pull_request_target')
@@ -272,6 +282,7 @@ jobs:
   update-linked-issues:
     name: 🔗 Mark Linked Issues Done on Staging Merge
     runs-on: ubuntu-latest
+    needs: [fork-guard]
     if: >
       always() &&
       github.event_name == 'pull_request_target' &&
