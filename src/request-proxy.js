@@ -72,7 +72,10 @@ export default function initRequestProxy({ enabled, url, bypass, enableKeepAlive
 
         // ProxyAgent uses proxy-from-env under the hood
         // Reference: https://github.com/Rob--W/proxy-from-env
-        process.env.all_proxy = url;
+        // Keep the file URL here: proxy-from-env prepends https:// to data
+        // URLs because they do not contain ://. Substitute the inlined URL
+        // only after environment proxy selection and bypass matching.
+        process.env.all_proxy = originalUrl;
 
         if (Array.isArray(bypass) && bypass.length > 0) {
             process.env.no_proxy = bypass.join(',');
@@ -82,6 +85,11 @@ export default function initRequestProxy({ enabled, url, bypass, enableKeepAlive
         const httpsAgent = https.globalAgent;
 
         const proxyAgent = new ProxyAgent({ httpAgent, httpsAgent, keepAlive: enableKeepAlive });
+        const resolveProxy = proxyAgent.getProxyForUrl;
+        proxyAgent.getProxyForUrl = async (targetUrl, request) => {
+            const selected = await resolveProxy(targetUrl, request);
+            return selected === originalUrl ? url : selected;
+        };
 
         http.globalAgent = proxyAgent;
         https.globalAgent = proxyAgent;
